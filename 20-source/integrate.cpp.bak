@@ -1,0 +1,240 @@
+#include <SDL2/SDL.h>
+#include <pthread.h>
+#include <unistd.h>
+extern "C" {
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+}
+
+SDL_Thread *render_thread;  // Rendering thread
+SDL_Event render_event;     // Event to signal render thread
+pthread_mutex_t render_mutex =
+    PTHREAD_MUTEX_INITIALIZER;  // Mutex to protect shared frame data
+SDL_mutex *video_mutex;
+
+int64_t last_pts = 0;
+int64_t current_pts = 0;
+AVFrame *frame = NULL;  // Frame to render
+int isRunning = 1;      // Flag for running threads
+AVCodecContext *codec_ctx = NULL;
+
+typedef struct {
+  SDL_Renderer *renderer;
+  SDL_Texture *texture;
+} RenderData;
+
+// Video decoding thread
+int video_decode_thread(void *arg) {
+  AVPacket pkt;
+  int ret;
+  AVFormatContext *format_ctx = (AVFormatContext *)arg;
+
+  if (frame == NULL) {
+    frame = av_frame_alloc();  // Ensure it's allocated
+    if (frame == NULL) {
+      fprintf(stderr, "Could not allocate frame memory\n");
+      return -1;  // Handle error appropriately
+    }
+  }
+  while (isRunning) {
+    if (av_read_frame(format_ctx, &pkt) >= 0) {
+      if (pkt.stream_index == 0) {  // Video stream
+        ret = avcodec_send_packet(codec_ctx, &pkt);
+        if (ret < 0) {
+          fprintf(stderr, "Error sending packet to decoder\n");
+          break;
+        }
+        ret = avcodec_receive_frame(codec_ctx, frame);
+        if (ret == 0) {
+          current_pts = frame->pts;
+          if (last_pts != 0) {
+            int64_t delay = (current_pts - last_pts) *
+                            av_q2d(format_ctx->streams[0]->time_base) * 1000;
+            if (delay > 0) {
+              SDL_Delay(delay);
+            }
+          }
+
+          // Signal the render thread to render the current frame
+          SDL_LockMutex(video_mutex);
+          SDL_PushEvent(
+              &render_event);  // Ensure render thread reacts to frame data
+          last_pts = current_pts;
+          SDL_UnlockMutex(video_mutex);
+        }
+      }
+      av_packet_unref(&pkt);
+    }
+  }
+  return 0;
+}
+
+// Render thread
+int render_frame(void *arg) {
+  RenderData *data = (RenderData *)arg;
+  SDL_Renderer *renderer = data->renderer;
+  SDL_Texture *texture = data->texture;
+
+  struct SwsContext *sws_ctx = sws_getContext(
+    frame->width, frame->height, (AVPixelFormat)frame->format, frame->width,
+    frame->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+
+  while (isRunning) {
+    if (SDL_WaitEvent(&render_event)) {
+      pthread_mutex_lock(&render_mutex);
+      if (frame != NULL) {
+        SDL_UpdateTexture(texture, NULL, frame->data[0], frame->linesize[0]);
+        SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, texture, NULL, NULL);
+        SDL_RenderPresent(renderer);
+      }
+      pthread_mutex_unlock(&render_mutex);
+    }
+  }
+  return 0;
+}
+
+// Initialize FFmpeg components
+void initFFmpeg(const char *filename, AVCodecContext **codec_ctx,
+                AVFrame **frame, AVFormatContext **format_ctx,
+                AVCodec **codec) {
+  // Open the input file with FFmpeg
+  if (avformat_open_input(format_ctx, filename, NULL, NULL) < 0) {
+    fprintf(stderr, "Could not open input file\n");
+    exit(1);
+  }
+
+  if (avformat_find_stream_info(*format_ctx, NULL) < 0) {
+    fprintf(stderr, "Could not find stream information\n");
+    exit(1);
+  }
+
+  // Find the video stream
+  int video_stream_index = -1;
+  for (int i = 0; i < (*format_ctx)->nb_streams; i++) {
+    if ((*format_ctx)->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+      video_stream_index = i;
+      break;
+    }
+  }
+
+  if (video_stream_index == -1) {
+    fprintf(stderr, "Could not find video stream\n");
+    exit(1);
+  }
+
+  // Find the decoder for the video stream
+  *codec = const_cast<AVCodec *>(avcodec_find_decoder(
+      (*format_ctx)->streams[video_stream_index]->codecpar->codec_id));
+  if (!*codec) {
+    fprintf(stderr, "Codec not found\n");
+    exit(1);
+  }
+
+  // Allocate codec context
+  *codec_ctx = avcodec_alloc_context3(*codec);
+  if (!*codec_ctx) {
+    fprintf(stderr, "Could not allocate codec context\n");
+    exit(1);
+  }
+
+  if (avcodec_parameters_to_context(
+          *codec_ctx, (*format_ctx)->streams[video_stream_index]->codecpar) <
+      0) {
+    fprintf(stderr, "Could not copy codec parameters to context\n");
+    exit(1);
+  }
+
+  if (avcodec_open2(*codec_ctx, *codec, NULL) < 0) {
+    fprintf(stderr, "Could not open codec\n");
+    exit(1);
+  }
+
+  *frame = av_frame_alloc();
+  if (!*frame) {
+    fprintf(stderr, "Could not allocate frame\n");
+    exit(1);
+  }
+}
+
+int main(int argc, char **argv) {
+  if (argc <= 1) {
+    fprintf(stderr, "Usage: %s <input file>\n", argv[0]);
+    return -1;
+  }
+
+  const char *filename = argv[1];
+  AVFormatContext *format_ctx = NULL;
+  AVFrame *frame = NULL;
+  AVCodec *codec = NULL;
+  AVPacket pkt;
+  SDL_Window *window = NULL;
+  SDL_Renderer *renderer = NULL;
+  SDL_Texture *texture = NULL;
+  SDL_Event event;
+
+  // Initialize SDL
+  if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+    fprintf(stderr, "SDL initialization failed: %s\n", SDL_GetError());
+    return -1;
+  }
+
+  // Create SDL window and renderer
+  window =
+      SDL_CreateWindow("MP4 Player", SDL_WINDOWPOS_UNDEFINED,
+                       SDL_WINDOWPOS_UNDEFINED, 1280, 720, SDL_WINDOW_SHOWN);
+  if (window == NULL) {
+    fprintf(stderr, "Window creation failed: %s\n", SDL_GetError());
+    SDL_Quit();
+    return -1;
+  }
+
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+  if (renderer == NULL) {
+    fprintf(stderr, "Renderer creation failed: %s\n", SDL_GetError());
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return -1;
+  }
+
+  // Create texture for video display
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
+                              SDL_TEXTUREACCESS_STREAMING, 1280, 720);
+  if (texture == NULL) {
+    fprintf(stderr, "Texture creation failed: %s\n", SDL_GetError());
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return -1;
+  }
+
+  // Initialize FFmpeg
+  initFFmpeg(filename, &codec_ctx, &frame, &format_ctx, &codec);
+
+  // Create a struct for passing to the render thread
+  RenderData renderData = {renderer, texture};
+
+  // Start decoding and rendering threads
+  render_thread = SDL_CreateThread(render_frame, "Render Thread", &renderData);
+  SDL_CreateThread(video_decode_thread, "Decode Thread", format_ctx);
+
+  // Main loop to handle SDL events (e.g., quit)
+  while (isRunning) {
+    while (SDL_PollEvent(&event)) {
+      if (event.type == SDL_QUIT) {
+        isRunning = 0;
+      }
+    }
+  }
+
+  // Cleanup
+  av_frame_free(&frame);
+  avcodec_free_context(&codec_ctx);
+  avformat_close_input(&format_ctx);
+  SDL_DestroyTexture(texture);
+  SDL_DestroyRenderer(renderer);
+  SDL_DestroyWindow(window);
+  SDL_Quit();
+
+  return 0;
+}
